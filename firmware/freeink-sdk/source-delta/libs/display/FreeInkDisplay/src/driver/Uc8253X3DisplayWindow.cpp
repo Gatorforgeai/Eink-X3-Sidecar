@@ -1,0 +1,270 @@
+// DESIGN INTENT:
+//   Windowed partial refresh for the UC8253/X3 panel. Overrides the PanelDriver
+//   base-class displayWindow(), which ignores x/y/w/h and refreshes the whole
+//   panel. Lives in its own translation unit so the 623-line driver .cpp is
+//   never rewritten wholesale.
+//
+// DONE WHEN:
+//   A call to displayWindow(bus, fb, prev, x, y, w, h, turnOff) refreshes ONLY
+//   the byte-aligned rect containing (x,y,w,h) and emits a serial line
+//   "[X3] displayWindow: rect=(...) rounded=(...) elapsed=NNNms". The elapsed
+//   number is materially below the full-panel Fast refresh time for the same
+//   panel (kill line: ~800 ms). Pixels outside the rounded rect are unchanged.
+//
+// INPUTS:
+//   bus     - EpdBus, already initialised; cmd/cmdData/beginTxn/rawWriteBytes/endTxn.
+//   fb      - new frame, 1bpp, _wb bytes per row, _h rows. Never null (guarded).
+//   prev    - previously-displayed frame, same layout, or nullptr. nullptr is the
+//             NORMAL case under EINK_DISPLAY_SINGLE_BUFFER_MODE=1: the controller's
+//             own DTM1 RAM holds the previous frame and must not be overwritten.
+//   x,y,w,h - logical rect, top-left origin. Clamped and rounded outward to bytes.
+//   turnOff - power the panel down after the refresh completes.
+//
+// USER SEES:
+//   One serial line per displayWindow() call, on the USB serial console only — nothing is written
+//   to a file, a task list, or the vault. Format:
+//     [X3] displayWindow: rect=(X,Y) w=WxH rounded=(X,Y) w=WxH) elapsed=NNNms turnOff=0|1
+//   At the bench cadence (partial every 1-2 s) that is ~30-60 lines per minute, which is the point:
+//   the number IS the experiment. Three additional one-shot fallback lines can appear, each stating
+//   why the windowed path was declined ("in grayscale mode", "RAM not synced"). An additional
+//   warning line appears whenever prev==fb. No other output. Nothing here runs unattended, so there
+//   is no unbounded log to cap.
+//
+// FAILS WHEN:
+//   - PTOUT is not emitted on some exit path: the controller stays clipped to the
+//     last window and every later full refresh is silently cropped until power
+//     cycle. Highest-severity failure in this file.
+//   - Full rows (_wb bytes) are sent instead of only the windowed columns: PTL
+//     clips the stream, so subsequent rows shift and pixels outside the window
+//     are corrupted.
+//   - Y is written in logical rather than gate space: the refreshed band appears
+//     mirrored vertically about the panel centre.
+//   - Both RAM planes are written from the same buffer: the diff is empty, the
+//     panel is visibly unchanged, and the timing still looks good.
+//   - This override is not actually linked: the base-class version runs, the whole
+//     panel refreshes, and the elapsed number is indistinguishable from full Fast.
+
+#include "Uc8253X3Driver.h"
+
+#include <Arduino.h>
+
+namespace freeink {
+namespace {
+
+// UC8253 commands used by the windowed partial-refresh path. These are local
+// copies of the constants in Uc8253X3Driver.cpp -- that file's anonymous-namespace
+// constants have internal linkage and are invisible from this translation unit.
+constexpr uint8_t CMD_DTM1            = 0x10;
+constexpr uint8_t CMD_DTM2            = 0x13;
+constexpr uint8_t CMD_DATA_STOP       = 0x11;
+constexpr uint8_t CMD_PARTIAL_WINDOW  = 0x90;  // PTL
+constexpr uint8_t CMD_PARTIAL_IN      = 0x91;  // PTIN
+constexpr uint8_t CMD_PARTIAL_OUT     = 0x92;  // PTOUT
+
+// RAII guard: guarantees CMD_PARTIAL_OUT is emitted on every exit path, including
+// early returns and errors. If PTOUT is skipped the controller stays clipped to
+// the last partial window and every later full refresh is silently cropped until
+// power cycle -- the highest-severity failure in this file (R6).
+struct PtOutGuard {
+  EpdBus& bus;
+  explicit PtOutGuard(EpdBus& b) : bus(b) { bus.cmd(CMD_PARTIAL_IN); }
+  ~PtOutGuard() { bus.cmd(CMD_PARTIAL_OUT); }
+  PtOutGuard(const PtOutGuard&) = delete;
+  PtOutGuard& operator=(const PtOutGuard&) = delete;
+};
+
+}  // namespace
+
+void Uc8253X3Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
+                                   uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOff) {
+  // R1 -- Signature match enforced by the compiler; no `override` on out-of-line defs.
+  // R16 -- Cheap argument checks FIRST, before any state inspection. A degenerate
+  // call must be a no-op with zero bus traffic and zero serial output.
+  if (!fb) return;
+  if (w == 0 || h == 0 || x >= _w || y >= _h) return;
+
+  // Clamp to panel bounds.
+  if (x + w > _w) w = static_cast<uint16_t>(_w - x);
+  if (y + h > _h) h = static_cast<uint16_t>(_h - y);
+
+  // R15 -- Guard against prev == fb. Computed after the silent returns so it only
+  // fires on a call that is otherwise real.
+  const bool sameBuffer = (prev != nullptr && prev == fb);
+  if (sameBuffer) {
+    Serial.print(F("[X3] displayWindow: prev==fb, skipping DTM1 write\r\n"));
+  }
+
+  // R7 -- Grayscale and windowing are mutually exclusive. If the panel is in
+  // grayscale mode, the RAM planes do not hold a coherent BW frame pair, so a
+  // windowed differential would mis-drive. Fall back to the full Fast path.
+  // R16 -- Pass sameBuffer ? nullptr : prev so an identical-pointer caller never
+  // forwards the same buffer as both planes' source.
+  if (_inGrayscaleMode) {
+    Serial.print(F("[X3] displayWindow: in grayscale mode, falling back to full Fast\r\n"));
+    display(bus, fb, sameBuffer ? nullptr : prev, RefreshMode::Fast, turnOff);
+    return;
+  }
+
+  // R16 -- RAM baseline unknown: windowed diff could drive pixels from an arbitrary
+  // baseline and produce ghosting. Fall back to full Fast. Checked before any
+  // window computation so a degenerate or off-panel call never reaches here.
+  // Same sameBuffer ? nullptr : prev treatment as the grayscale branch.
+  if (!_redRamSynced) {
+    Serial.print(F("[X3] displayWindow: RAM not synced, falling back to full Fast\r\n"));
+    display(bus, fb, sameBuffer ? nullptr : prev, RefreshMode::Fast, turnOff);
+    return;
+  }
+
+  // R3 -- X alignment. PTL horizontal resolution is 8 px; round OUTWARD so callers
+  // need not pre-align. The rounded rect is what actually refreshes.
+  const uint16_t xEndLogical = static_cast<uint16_t>(x + w - 1);
+  const uint16_t yEndLogical = static_cast<uint16_t>(y + h - 1);
+  const uint16_t xs = static_cast<uint16_t>(x & ~7u);
+  // Clamp xe to the rightmost pixel of the panel so we never address beyond RAM.
+  const uint16_t xe = static_cast<uint16_t>((xEndLogical | 7u) < (_w - 1) ? (xEndLogical | 7u) : (_w - 1));
+
+  // R4 -- Y is gate space. Logical row y lives at gate (_h - 1 - y); the PTL
+  // window registers expect gate coordinates.
+  const uint16_t gateYStart = static_cast<uint16_t>((_h - 1) - yEndLogical);
+  const uint16_t gateYEnd   = static_cast<uint16_t>((_h - 1) - y);
+
+  const uint8_t win[9] = {
+      static_cast<uint8_t>(xs >> 8),
+      static_cast<uint8_t>(xs & 0xFF),
+      static_cast<uint8_t>(xe >> 8),
+      static_cast<uint8_t>(xe & 0xFF),
+      static_cast<uint8_t>(gateYStart >> 8),
+      static_cast<uint8_t>(gateYStart & 0xFF),
+      static_cast<uint8_t>(gateYEnd >> 8),
+      static_cast<uint8_t>(gateYEnd & 0xFF),
+      0x01,  // matches preconditionGrayscale's 9th byte
+  };
+
+  // R10 -- Full-panel rect. A (0,0,W,H) rect is permitted and is windowed like any
+  // other; the PTL path handles it correctly and the timing measurement below
+  // captures the true cost. Delegating to display() here would hide the windowed
+  // path from the bench comparison, so we window it unconditionally.
+
+  // R5 -- Both RAM planes must be populated inside the window. BW Fast is a
+  // differential refresh: the controller diffs DTM2 (new) against DTM1 (old).
+  // Writing only one plane while the other holds stale full-frame state is the
+  // most likely defect -- it either produces edge artifacts or, if both planes
+  // are accidentally written from the SAME buffer, an empty diff that leaves the
+  // panel visibly unchanged while the timing still looks good.
+  //
+  // When prev is nullptr -- the NORMAL case under EINK_DISPLAY_SINGLE_BUFFER_MODE=1
+  // -- the controller's own DTM1 RAM already holds the previously-displayed frame.
+  // Writing DTM1 would destroy that baseline and produce an empty diff, so we skip
+  // the DTM1 write and let the controller supply the old plane. The _redRamSynced
+  // check above is what makes this safe for full-panel refreshes; whether the
+  // controller's retained DTM1 is a valid differential baseline specifically for
+  // a WINDOWED PTL refresh is UNVERIFIED (open question -- single-buffer mode has
+  // never been exercised through PTL).
+  //
+  // UNVERIFIED: whether windowBytes exactly matches PTL's horizontal byte
+  // expectation, or whether PTL pads the stream to the full window width.
+  // The comment below assumes exact clipping; if bench results show edge
+  // corruption or shifted rows, this assumption is the first thing to check.
+
+  // R8 -- Use the fast differential bank (CDI 0x29), NOT the grayscale
+  // precondition bank (CDI 0xA9). The precondition bank's strong BW/WB drives
+  // are tuned for settling a just-displayed frame, not for a targeted
+  // differential update; using it here would produce wrong contrast and could
+  // corrupt the seam between the windowed region and the surrounding pixels.
+
+  // R11 -- Time the WHOLE operation: from before the first RAM write to after the
+  // refresh completes. A refresh-only number would understate the true cost and
+  // could let a window that should fail the ~800 ms kill line appear to pass.
+  PtOutGuard ptout(bus);  // R6 -- PTOUT on every exit path (constructed after all early returns)
+  const unsigned long t0 = millis();
+
+  bus.cmdData(CMD_PARTIAL_WINDOW, win, 9);
+
+  // R8 -- Fast differential bank.
+  loadBankCdi(bus, 0x29, 0x07, _cfg.fast);
+
+  // Compute the byte range that falls inside the horizontal PTL window.
+  // PTL clips the SPI data stream to the window, so we must send EXACTLY the
+  // bytes that belong to the windowed columns -- sending a full row (_wb bytes)
+  // would shift subsequent row data and corrupt pixels outside the window.
+  // (UNVERIFIED: see note above on PTL horizontal byte expectation.)
+  const uint16_t byteStart = static_cast<uint16_t>(xs / 8);
+  const uint16_t windowBytes = static_cast<uint16_t>((xe - xs) / 8 + 1);
+
+  // Write DTM1 (old plane) from `prev` within the window -- only when the caller
+  // actually has a previous frame AND it is not the same buffer as fb.
+  // See the single-buffer note above.
+  if (prev && !sameBuffer) {
+    bus.cmd(CMD_DTM1);
+    bus.beginTxn();
+    // R13 -- Rows emitted BOTTOM-FIRST (descending). The PTL window latches
+    // gateYStart (the rect's BOTTOM logical row) as the first gate, so the
+    // first byte sent must come from the bottom of the rect. Sending top-first
+    // mirrors the window vertically. Matches sendGrayPlaneWindow in the driver.
+    for (int row = static_cast<int>(h) - 1; row >= 0; row--) {
+      const uint16_t srcRow = static_cast<uint16_t>(y + row);
+      bus.rawWriteBytes(prev + static_cast<uint32_t>(srcRow) * _wb + byteStart, windowBytes);
+    }
+    bus.endTxn();
+    bus.cmd(CMD_DATA_STOP);
+  }
+
+  // Write DTM2 (new plane) from `fb` within the window.
+  bus.cmd(CMD_DTM2);
+  bus.beginTxn();
+  // R13 -- Same bottom-first order as DTM1 above. A mismatch between the two
+  // planes would produce a garbage differential, worse than both being wrong
+  // the same way.
+  for (int row = static_cast<int>(h) - 1; row >= 0; row--) {
+    const uint16_t srcRow = static_cast<uint16_t>(y + row);
+    bus.rawWriteBytes(fb + static_cast<uint32_t>(srcRow) * _wb + byteStart, windowBytes);
+  }
+  bus.endTxn();
+  bus.cmd(CMD_DATA_STOP);
+
+  // Fire the refresh. triggerRefresh() handles power-on, BUSY-wait, and
+  // optional power-off (turnOff).
+  triggerRefresh(bus, turnOff);
+
+  const unsigned long elapsed = millis() - t0;
+
+  // R9/R14 -- Instrumentation. Emit the rounded rect, the gate-space Y values
+  // actually latched into the PTL registers, the row order, and the elapsed
+  // time. Only the windowed number is emitted here; the full-panel Fast
+  // comparison happens at the bench from the display() path.
+  Serial.print(F("[X3] displayWindow: rect=("));
+  Serial.print(x);
+  Serial.print(F(","));
+  Serial.print(y);
+  Serial.print(F(") w="));
+  Serial.print(w);
+  Serial.print(F("x"));
+  Serial.print(h);
+  Serial.print(F(" rounded=("));
+  Serial.print(xs);
+  Serial.print(F(","));
+  Serial.print(y);
+  Serial.print(F(") w="));
+  Serial.print(xe - xs + 1);
+  Serial.print(F("x"));
+  Serial.print(h);
+  Serial.print(F(" gateY=["));
+  Serial.print(gateYStart);
+  Serial.print(F(".."));
+  Serial.print(gateYEnd);
+  Serial.print(F("] rows=bottom-first"));
+  Serial.print(F(" elapsed="));
+  Serial.print(elapsed);
+  Serial.print(F("ms turnOff="));
+  Serial.print(turnOff ? '1' : '0');
+  Serial.print(F("\r\n"));
+
+  // R12 -- PTOUT-after-power-off: when turnOff is true, triggerRefresh() has
+  // already powered the panel down. The PtOutGuard destructor then emits PTOUT
+  // after power-off. This ordering is unvalidated for the UC8253; the bench
+  // should verify that the subsequent full refresh is not silently cropped.
+  // The guard MUST run (R6 outranks the ordering concern), so we do not
+  // restructure -- we flag it for the bench instead.
+}
+
+}  // namespace freeink

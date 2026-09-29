@@ -1,0 +1,42 @@
+# Android / Gradle build output
+build/
+.gradle/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Signing material - NEVER commit
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Code gate run artifacts (machine output, not source)
+.checks/
+gate_out.txt
+gate_done.marker
+_authoring/
+
+# Local hardware-trial and Forge working artifacts
+.kotlin/
+_scratch_*
+_forge_*
+_intent_*
+_quarantine_*/
+_*.cmd
+_*.log
+_*.DONE
+_*.txt
+_ui_dump.xml
+hs_err_pid*.log

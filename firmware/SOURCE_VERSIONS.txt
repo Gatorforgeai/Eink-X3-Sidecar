@@ -1,0 +1,4 @@
+CrossPoint upstream base: eea75d561b8cd4fe4a9ef3850488a4561af0b8e6
+Sidecar firmware commit: 543c14fbe27e3556967257a88a1265f0e6d62415
+FreeInk SDK upstream base: ae68356de994a536dd6c45615a42ea485b3dddca
+Sidecar FreeInk SDK commit: a093eb8c6218fe83a5b0f2a5b4abac34fbfe419d

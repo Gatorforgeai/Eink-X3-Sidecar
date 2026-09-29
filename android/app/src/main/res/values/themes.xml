@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Use AppCompat DayNight DarkActionBar (not Material3) because the module depends on
+         appcompat only and MainActivity extends AppCompatActivity. Keeps the dark action bar
+         consistent with the One-UI bench harness while following the device dark-mode setting. -->
+    <style name="Theme.TrackB" parent="Theme.AppCompat.DayNight.DarkActionBar" />
+</resources>
